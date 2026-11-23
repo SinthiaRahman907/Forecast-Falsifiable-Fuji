@@ -172,6 +172,46 @@ END;
 CREATE TRIGGER IF NOT EXISTS scores_immutable_delete BEFORE DELETE ON scores BEGIN
     SELECT RAISE(ABORT, 'scores are immutable');
 END;
+-- INSERT OR REPLACE deletes the old row without firing DELETE triggers
+-- (unless recursive_triggers is on), so refuse any insert that would
+-- collide with an existing row. A plain INSERT would fail on these anyway.
+CREATE TRIGGER IF NOT EXISTS cases_no_replace BEFORE INSERT ON cases
+WHEN EXISTS (SELECT 1 FROM cases WHERE case_id = NEW.case_id
+             OR (experiment_id = NEW.experiment_id AND case_key = NEW.case_key))
+BEGIN
+    SELECT RAISE(ABORT, 'cases cannot be replaced');
+END;
+CREATE TRIGGER IF NOT EXISTS propositions_no_replace BEFORE INSERT ON propositions
+WHEN EXISTS (SELECT 1 FROM propositions WHERE proposition_id = NEW.proposition_id
+             OR (case_id = NEW.case_id AND proposition_key = NEW.proposition_key))
+BEGIN
+    SELECT RAISE(ABORT, 'propositions cannot be replaced');
+END;
+CREATE TRIGGER IF NOT EXISTS forecasts_no_replace BEFORE INSERT ON forecasts
+WHEN EXISTS (SELECT 1 FROM forecasts WHERE forecast_id = NEW.forecast_id
+             OR (proposition_id = NEW.proposition_id AND member = NEW.member))
+BEGIN
+    SELECT RAISE(ABORT, 'locked forecasts are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS baselines_no_replace BEFORE INSERT ON baselines
+WHEN EXISTS (SELECT 1 FROM baselines WHERE baseline_id = NEW.baseline_id
+             OR (proposition_id = NEW.proposition_id AND baseline_type = NEW.baseline_type))
+BEGIN
+    SELECT RAISE(ABORT, 'locked baselines are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS resolutions_no_replace BEFORE INSERT ON resolutions
+WHEN EXISTS (SELECT 1 FROM resolutions WHERE resolution_id = NEW.resolution_id
+             OR proposition_id = NEW.proposition_id)
+BEGIN
+    SELECT RAISE(ABORT, 'resolutions are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS scores_no_replace BEFORE INSERT ON scores
+WHEN EXISTS (SELECT 1 FROM scores WHERE score_id = NEW.score_id
+             OR (proposition_id = NEW.proposition_id AND method_type = NEW.method_type
+                 AND method_name = NEW.method_name))
+BEGIN
+    SELECT RAISE(ABORT, 'scores are immutable');
+END;
 """
 
 
@@ -188,6 +228,8 @@ class Fuji:
     def __init__(self, path: str | Path = ":memory:") -> None:
         self.conn = sqlite3.connect(str(path))
         self.conn.row_factory = sqlite3.Row
+        # Fire DELETE triggers for rows that INSERT OR REPLACE removes, too.
+        self.conn.execute("PRAGMA recursive_triggers = ON")
         self.conn.executescript(SCHEMA)
 
     def close(self) -> None:
