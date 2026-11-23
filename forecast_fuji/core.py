@@ -104,6 +104,74 @@ END;
 CREATE TRIGGER IF NOT EXISTS resolutions_immutable_delete BEFORE DELETE ON resolutions BEGIN
     SELECT RAISE(ABORT, 'resolutions are immutable');
 END;
+-- Once a case is locked, its question and record are fixed. These triggers
+-- hold the invariant in the database itself, not only in the Python API.
+CREATE TRIGGER IF NOT EXISTS cases_locked_immutable BEFORE UPDATE ON cases
+WHEN OLD.forecast_status <> 'PENDING' AND (
+    NEW.case_id IS NOT OLD.case_id OR NEW.experiment_id IS NOT OLD.experiment_id
+    OR NEW.case_key IS NOT OLD.case_key OR NEW.evidence_cutoff_at IS NOT OLD.evidence_cutoff_at
+    OR NEW.metadata_json IS NOT OLD.metadata_json OR NEW.created_at IS NOT OLD.created_at
+    OR NEW.forecast_status <> 'LOCKED')
+BEGIN
+    SELECT RAISE(ABORT, 'locked cases are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS cases_resolution_forward_only BEFORE UPDATE OF resolution_status ON cases
+WHEN (OLD.resolution_status = 'RESOLVED' AND NEW.resolution_status <> 'RESOLVED')
+    OR (NEW.resolution_status = 'RESOLVED' AND NEW.forecast_status <> 'LOCKED')
+BEGIN
+    SELECT RAISE(ABORT, 'a case resolves only once, and only after it is locked');
+END;
+CREATE TRIGGER IF NOT EXISTS cases_locked_delete BEFORE DELETE ON cases
+WHEN OLD.forecast_status <> 'PENDING'
+BEGIN
+    SELECT RAISE(ABORT, 'locked cases are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS propositions_insert_requires_pending BEFORE INSERT ON propositions
+WHEN (SELECT forecast_status FROM cases WHERE case_id = NEW.case_id) <> 'PENDING'
+BEGIN
+    SELECT RAISE(ABORT, 'case is locked; propositions are fixed');
+END;
+CREATE TRIGGER IF NOT EXISTS propositions_locked_update BEFORE UPDATE ON propositions
+WHEN (SELECT forecast_status FROM cases WHERE case_id = OLD.case_id) <> 'PENDING'
+    OR (SELECT forecast_status FROM cases WHERE case_id = NEW.case_id) <> 'PENDING'
+BEGIN
+    SELECT RAISE(ABORT, 'propositions are immutable once their case is locked');
+END;
+CREATE TRIGGER IF NOT EXISTS propositions_locked_delete BEFORE DELETE ON propositions
+WHEN (SELECT forecast_status FROM cases WHERE case_id = OLD.case_id) <> 'PENDING'
+BEGIN
+    SELECT RAISE(ABORT, 'propositions are immutable once their case is locked');
+END;
+CREATE TRIGGER IF NOT EXISTS forecasts_insert_requires_pending BEFORE INSERT ON forecasts
+WHEN (SELECT c.forecast_status FROM cases c JOIN propositions p ON p.case_id = c.case_id
+      WHERE p.proposition_id = NEW.proposition_id) <> 'PENDING'
+BEGIN
+    SELECT RAISE(ABORT, 'case is locked; late forecasts are not allowed');
+END;
+CREATE TRIGGER IF NOT EXISTS baselines_insert_requires_pending BEFORE INSERT ON baselines
+WHEN (SELECT c.forecast_status FROM cases c JOIN propositions p ON p.case_id = c.case_id
+      WHERE p.proposition_id = NEW.proposition_id) <> 'PENDING'
+BEGIN
+    SELECT RAISE(ABORT, 'case is locked; late baselines are not allowed');
+END;
+CREATE TRIGGER IF NOT EXISTS resolutions_insert_requires_locked BEFORE INSERT ON resolutions
+WHEN (SELECT c.forecast_status FROM cases c JOIN propositions p ON p.case_id = c.case_id
+      WHERE p.proposition_id = NEW.proposition_id) <> 'LOCKED'
+BEGIN
+    SELECT RAISE(ABORT, 'case must be locked before resolution');
+END;
+CREATE TRIGGER IF NOT EXISTS scores_require_resolution BEFORE INSERT ON scores
+WHEN NOT EXISTS (SELECT 1 FROM resolutions r
+                 WHERE r.proposition_id = NEW.proposition_id AND r.outcome = NEW.outcome)
+BEGIN
+    SELECT RAISE(ABORT, 'scores must match a recorded resolution');
+END;
+CREATE TRIGGER IF NOT EXISTS scores_immutable_update BEFORE UPDATE ON scores BEGIN
+    SELECT RAISE(ABORT, 'scores are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS scores_immutable_delete BEFORE DELETE ON scores BEGIN
+    SELECT RAISE(ABORT, 'scores are immutable');
+END;
 """
 
 
@@ -185,7 +253,14 @@ class Fuji:
         self.conn.commit()
         return baseline_id
 
-    def lock_case(self, case_id: str, *, min_members: int = 3) -> list[Aggregate]:
+    def lock_case(self, case_id: str, *, min_members: int = 1) -> list[Aggregate]:
+        """Lock every proposition of a case.
+
+        One forecaster is enough for an individual forecast (see the
+        universal workflow contract). Pass min_members to require a panel.
+        """
+        if min_members < 1:
+            raise ValueError("min_members must be at least 1")
         self._assert_case_pending(case_id)
         props = self.conn.execute(
             "SELECT proposition_id, proposition_key FROM propositions WHERE case_id=? ORDER BY proposition_key", (case_id,)
