@@ -94,6 +94,31 @@ class Finding1RecordIntegrity(AuditBase):
                 "INSERT INTO resolutions(resolution_id,proposition_id,outcome,resolved_at) "
                 "VALUES('early',?,1,'2026')", (self.prop,))
 
+    def test_insert_or_replace_cannot_overwrite_the_record(self):
+        # REPLACE deletes the old row without firing DELETE triggers, so every
+        # table refuses an insert that collides with an existing row.
+        # Found in the Claude comparison run (its item C1).
+        self.lock_and_resolve(outcome=False)
+        rid = self.fuji.conn.execute("SELECT resolution_id FROM resolutions").fetchone()[0]
+        sid = self.fuji.conn.execute(
+            "SELECT score_id FROM scores WHERE method_type='FORECAST'").fetchone()[0]
+        fid = self.fuji.conn.execute("SELECT forecast_id FROM forecasts").fetchone()[0]
+        cases = (
+            ("REPLACE INTO resolutions(resolution_id,proposition_id,outcome,resolved_at) "
+             "VALUES(?,?,1,'2026')", (rid, self.prop)),
+            ("REPLACE INTO scores(score_id,proposition_id,method_type,method_name,probability,outcome,"
+             "brier,created_at) VALUES(?,?,'FORECAST','a',0.9,0,0.0,'2026')", (sid, self.prop)),
+            ("REPLACE INTO forecasts(forecast_id,proposition_id,member,probability,locked_at) "
+             "VALUES(?,?,'a',0.0,'2026')", (fid, self.prop)),
+            ("REPLACE INTO cases(case_id,experiment_id,case_key,evidence_cutoff_at,created_at) "
+             "VALUES(?,?,'c1','2026','2026')", (self.case, self.exp)),
+        )
+        for sql, args in cases:
+            with self.subTest(sql=sql.split("(")[0]), self.assertRaises(sqlite3.IntegrityError):
+                self.fuji.conn.execute(sql, args)
+        outcome = self.fuji.conn.execute("SELECT outcome FROM resolutions").fetchone()[0]
+        self.assertEqual(outcome, 0)
+
     def test_pending_case_can_still_be_edited_before_lock(self):
         # The new rules apply only once a case is locked.
         self.fuji.conn.execute(
